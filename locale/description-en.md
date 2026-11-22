@@ -34,4 +34,29 @@ Maps should be registered with the maploader
 --]]
 modules.files:registerFileSource(path)
 
+--[[
+Add a folder of .map files to the game's map lists. `which` is "both" (default), "crusader" or "extreme".
+Several folders can be registered, for example one per plugin.
+--]]
+modules.files:registerExtraMapDirectory(path, which)
+
 ```
+
+## Maps that appear from a date on
+An extra map folder (from `registerExtraMapDirectory` or the maploader's extra map directory) can hold a file named `availability.json`. Every map named in it is listed in the game only from its date on, in the player's local time. Maps that are not named are listed as usual. This is meant for map packs that open one map per day, such as an advent calendar.
+
+```json
+{
+  "format": 1,
+  "maps": {
+    "Door01": "2026-12-01",
+    "Door02": "2026-12-02"
+  }
+}
+```
+
+- Map names are the file names, with or without `.map`, in any letter case.
+- A missing or broken file, or an entry without a valid `YYYY-MM-DD` date, never hides a map. The module writes a warning to the log and lists the map.
+- The game checks the dates whenever it builds its map list. A map whose day starts while the game is running appears the next time the list is built.
+- Saved games are not affected.
+- Map authors can preview a schedule without changing the system clock: set the option `map-availability-date` to a date such as `2026-12-05`, in the files or maploader configuration. That date then counts as today.

@@ -7,6 +7,123 @@ local DISABLE_USER_DIR_SAVS_EXTREME = false
 
 local EXTRA_DIRS = {}
 
+--[[
+Dated map availability.
+
+An extra map directory may contain a file named availability.json:
+
+  {
+    "format": 1,
+    "maps": {
+      "Door01": "2026-12-01",
+      "Door02": "2026-12-02"
+    }
+  }
+
+A map named in "maps" (with or without ".map") is listed by the game only from that date on,
+in the player's local time. Maps that are not named are listed as before. A missing or invalid
+file, or an invalid entry, never hides a map: a warning is logged and the map is listed.
+
+The option "map-availability-date" ("YYYY-MM-DD") makes that date count as today, so map
+authors and testers can preview a schedule without changing the system clock.
+
+The date is checked each time the game builds its map list, so a map whose date arrives while
+the game runs appears the next time the list is built.
+--]]
+local AVAILABILITY_FILE_NAME = "availability.json"
+
+---Per FindFirstFile pattern of an extra directory (lower case): lower-case map name -> yyyymmdd
+---@type table<string, table<string, number>>
+local AVAILABLE_FROM = {}
+
+---yyyymmdd that counts as today instead of the system date, or nil
+---@type number|nil
+local TODAY_OVERRIDE = nil
+
+---Parses "YYYY-MM-DD" into yyyymmdd, or returns nil
+local function parseDate(value)
+    if type(value) ~= "string" then return nil end
+    local y, m, d = value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+    if y == nil then return nil end
+    y, m, d = tonumber(y), tonumber(m), tonumber(d)
+    if m < 1 or m > 12 or d < 1 or d > 31 then return nil end
+    return y * 10000 + m * 100 + d
+end
+
+local function today()
+    if TODAY_OVERRIDE ~= nil then return TODAY_OVERRIDE end
+    local now = os.date("*t")
+    return now.year * 10000 + now.month * 100 + now.day
+end
+
+local function mapKey(name)
+    local key = name:lower()
+    if key:sub(-4) == ".map" then key = key:sub(1, -5) end
+    return key
+end
+
+---Reads the availability.json of an extra map directory.
+---@param dir string the directory as registered
+---@return table<string, number>|nil lower-case map name -> yyyymmdd, nil without a usable file
+local function readAvailability(dir)
+    local path = dir
+    if path:sub(-1) ~= "/" and path:sub(-1) ~= "\\" then path = path .. "/" end
+    path = path .. AVAILABILITY_FILE_NAME
+
+    local handle = io.open(path, "rb")
+    if handle == nil then return nil end
+    local text = handle:read("*all")
+    handle:close()
+
+    local ok, data = pcall(function() return json:decode(text) end)
+    if not ok or type(data) ~= "table" or type(data.maps) ~= "table" then
+        log(WARNING, string.format("%s is not a valid availability file; every map in this folder is listed", path))
+        return nil
+    end
+    if data.format ~= nil and data.format ~= 1 then
+        log(WARNING, string.format("%s: unknown format %s; every map in this folder is listed", path, tostring(data.format)))
+        return nil
+    end
+
+    local result = {}
+    local count = 0
+    for name, date in pairs(data.maps) do
+        local from = parseDate(date)
+        if type(name) ~= "string" or name == "" or from == nil then
+            log(WARNING, string.format("%s: entry %s = %s ignored (expected a map name and \"YYYY-MM-DD\"); the map is listed",
+                path, tostring(name), tostring(date)))
+        else
+            result[mapKey(name)] = from
+            count = count + 1
+        end
+    end
+    log(INFO, string.format("%s: %d maps with a date", path, count))
+    return result
+end
+
+---Remembers the dated maps of an extra directory under its FindFirstFile pattern
+local function registerAvailability(fnfDir, dir)
+    local dated = readAvailability(dir)
+    if dated ~= nil then
+        AVAILABLE_FROM[fnfDir:lower()] = dated
+    end
+end
+
+local function setTodayOverride(value)
+    if value == nil or value == "" then
+        TODAY_OVERRIDE = nil
+        return
+    end
+    local parsed = parseDate(value)
+    if parsed == nil then
+        log(WARNING, string.format("map-availability-date: %s ignored (expected \"YYYY-MM-DD\")", tostring(value)))
+        TODAY_OVERRIDE = nil
+        return
+    end
+    log(INFO, string.format("map-availability-date: dated maps are listed as on %s", value))
+    TODAY_OVERRIDE = parsed
+end
+
 local function RawFindFileInterface()
     local addressOfFindFirstFileARef = core.readInteger(core.AOBScan("8D 4C 24 60 51 57") + 8)
     local addressOfFindFirstFileA = core.readInteger(addressOfFindFirstFileARef)
@@ -180,24 +297,39 @@ local DiscoveryHandler = {
         core.writeString(ptr_targetPattern, pattern)
         local handle = rawInterface.FindFirstFileA(ptr_targetPattern, ptr_win32FindData)
 
+        local dated = AVAILABLE_FROM[pattern:lower()]
+        local now = dated ~= nil and today() or nil
+        local notYet = 0
+
         if handle ~= -1 then
             while self.count < 500 do
                 local name = filename()
                 local t = dosTime()
 
-                if self.filetimes[name:lower()] == nil then
-                    log(VERBOSE, string.format("discoverForPattern: discovered new map: %s", name))
-                    table.insert(self.filenames, name)
-                    self.count = self.count + 1
-                end
+                local from = dated ~= nil and dated[mapKey(name)] or nil
+                if from ~= nil and from > now then
+                    log(VERBOSE, string.format("discoverForPattern: %s is listed from %d on", name, from))
+                    notYet = notYet + 1
+                else
+                    if self.filetimes[name:lower()] == nil then
+                        log(VERBOSE, string.format("discoverForPattern: discovered new map: %s", name))
+                        table.insert(self.filenames, name)
+                        self.count = self.count + 1
+                    end
 
-                self.filetimes[name:lower()] = t
+                    self.filetimes[name:lower()] = t
+                end
 
                 local hasNext = rawInterface.FindNextFileA(handle, ptr_win32FindData)
                 if hasNext == 0 then
                     break
                 end
             end
+        end
+
+        if dated ~= nil then
+            log(INFO, string.format("discoverForPattern: %s: %d maps not listed yet (today counts as %d)",
+                pattern, notYet, now))
         end
 
         rawInterface.FindClose(handle)
@@ -438,6 +570,7 @@ return {
 
                 log(DEBUG, "Registering extra map dir: " .. tostring(fnfDir))
 
+                registerAvailability(fnfDir, dir)
                 registerExtraDir("maps\\*.map", fnfDir)
                 -- registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
@@ -457,6 +590,7 @@ return {
 
                 log(DEBUG, "Registering extra map extreme dir: " .. tostring(fnfDir))
 
+                registerAvailability(fnfDir, dir)
                 -- registerExtraDir("maps\\*.map", fnfDir)
                 registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
@@ -471,9 +605,17 @@ return {
             --registerExtraDir("maps\\*.map", config["extra-sav-directory"])
             print("WARNING: not implemented: 'extra-sav-directory'")
         end
+
+        if key == "map-availability-date" then
+            setTodayOverride(value)
+        end
     end,
 
     enable = function(config)
+        if type(config) == "table" and config["map-availability-date"] ~= nil then
+            setTodayOverride(config["map-availability-date"])
+        end
+
         local ptr_discoverMapFiles = core.AOBScan("6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 81 EC 3C 02 00 00")
 
         core.hookCode(discoverMapFiles_hook, ptr_discoverMapFiles, 2, 1, 7)
@@ -497,7 +639,7 @@ return {
       -- FindNextFile Directory should end with *.map
       local fnfDir = prepareDir(dir, "map")
 
-      
+      registerAvailability(fnfDir, dir)
 
       if which == "both" or which == "crusader" then
         log(DEBUG, "Registering extra map crusader dir: " .. tostring(fnfDir))
