@@ -47,9 +47,9 @@ local AVAILABILITY_MAX_BYTES = 32 * 1024
 ---@type table<string, table<string, number>>
 local AVAILABLE_FROM = {}
 
----Per FindFirstFile pattern (lower case): dated maps whose file redirect is registered once
----their date has come: list of { trigger, path, from, registered }
----@type table<string, table>
+---Per FindFirstFile pattern (lower case) and game ("crusader", "extreme"): dated maps whose
+---file redirect is registered once their date has come: list of { trigger, path, from, registered }
+---@type table<string, table<string, table>>
 local DATED_MAPS = {}
 
 ---yyyymmdd that counts as today instead of the system date, or nil
@@ -78,6 +78,7 @@ end
 ---Today as yyyymmdd, or nil when the system date can't be read
 local function today()
     if TODAY_OVERRIDE ~= nil then return TODAY_OVERRIDE end
+    if os == nil or os.date == nil then return nil end
     local ok, now = pcall(os.date, "*t")
     if not ok or type(now) ~= "table" then return nil end
     return now.year * 10000 + now.month * 100 + now.day
@@ -125,6 +126,7 @@ local JSON_ESCAPES = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\
 local function decodeJson(text)
     local pos, len = 1, #text
     local repeated = {} -- object table -> list of { key, value } for keys seen before
+    local nulls = {}    -- object table -> keys whose value is null
 
     local function fail(message)
         error({ json = string.format("%s at byte %d", message, pos) }, 0)
@@ -163,9 +165,17 @@ local function decodeJson(text)
                 pos = s
                 if not hex:match("^%x%x%x%x$") then fail("bad \\u escape") end
                 local codepoint = tonumber(hex, 16)
-                if codepoint >= 0xD800 and codepoint <= 0xDFFF then fail("unsupported \\u escape") end
+                local length = 6
+                if codepoint >= 0xD800 and codepoint <= 0xDBFF then
+                    local low = text:sub(s + 6, s + 11)
+                    if not low:match("^\\u[dD][c-fC-F]%x%x$") then fail("unpaired \\u escape") end
+                    codepoint = 0x10000 + (codepoint - 0xD800) * 0x400 + (tonumber(low:sub(3), 16) - 0xDC00)
+                    length = 12
+                elseif codepoint >= 0xDC00 and codepoint <= 0xDFFF then
+                    fail("unpaired \\u escape")
+                end
                 parts[#parts + 1] = utf8.char(codepoint)
-                pos = s + 6
+                pos = s + length
             else
                 pos = s
                 fail("bad escape")
@@ -219,6 +229,10 @@ local function decodeJson(text)
                 skip()
                 expect(":")
                 local value = parseValue(depth + 1)
+                if value == nil then
+                    nulls[object] = nulls[object] or {}
+                    table.insert(nulls[object], key)
+                end
                 if seen[key] then
                     repeated[object] = repeated[object] or {}
                     table.insert(repeated[object], { key, value })
@@ -257,7 +271,7 @@ local function decodeJson(text)
         if type(value) == "table" and value.json ~= nil then return nil, value.json end
         return nil, tostring(value)
     end
-    return value, nil, repeated
+    return value, nil, repeated, nulls
 end
 
 ---The folder of a registered directory, which may end in "\*.map"
@@ -275,7 +289,7 @@ local function readAvailability(dir)
     -- folders of extensions that aren't installed; such folders simply have no schedule.
     local opened, handle = pcall(io.open, path, "rb")
     if not opened or handle == nil then
-        log(VERBOSE, string.format("readAvailability: no availability file at %s", path))
+        log(VERBOSE, string.format("readAvailability: no readable availability file at %s", path))
         return nil
     end
     local read, text = pcall(function() return handle:read(AVAILABILITY_MAX_BYTES + 1) end)
@@ -294,7 +308,7 @@ local function readAvailability(dir)
         text = text:sub(4) -- UTF-8 byte order mark
     end
 
-    local data, decodeError, repeated = decodeJson(text)
+    local data, decodeError, repeated, nulls = decodeJson(text)
     if type(data) ~= "table" then
         log(WARNING, string.format("%s is not valid JSON (%s); every map in this folder is listed",
             path, tostring(decodeError or "not an object")))
@@ -315,6 +329,9 @@ local function readAvailability(dir)
     end
     for _, entry in ipairs(repeated[data.maps] or {}) do
         table.insert(entries, entry)
+    end
+    for _, name in ipairs(nulls[data.maps] or {}) do
+        table.insert(entries, { name, nil })
     end
 
     local result = {}
@@ -348,21 +365,28 @@ end
 ---Reads the schedule of an extra directory and remembers it under its FindFirstFile pattern,
 ---replacing what an earlier registration of the same directory left.
 ---@return table<string, number>|nil the dated maps of the directory
-local function registerAvailability(fnfDir, dir)
+---@param games table<string, boolean> the games this registration is for ({crusader = true} ...)
+local function registerAvailability(fnfDir, dir, games)
     local dated = readAvailability(dir)
-    AVAILABLE_FROM[fnfDir:lower()] = dated
-    DATED_MAPS[fnfDir:lower()] = {}
+    local key = fnfDir:lower()
+    AVAILABLE_FROM[key] = dated
+    DATED_MAPS[key] = DATED_MAPS[key] or {}
+    for game in pairs(games) do
+        DATED_MAPS[key][game] = {}
+    end
     return dated
 end
 
 ---Registers the file redirects of the dated maps of `pattern` whose date has come
 local function activateDatedMaps(pattern, now)
-    local list = DATED_MAPS[pattern:lower()]
-    if list == nil then return end
-    for _, entry in ipairs(list) do
-        if not entry.registered and isAvailable(entry.from, now) then
-            entry.registered = true
-            modules.files:overrideFileWith(entry.trigger, entry.path)
+    local lists = DATED_MAPS[pattern:lower()]
+    if lists == nil then return end
+    for _, list in pairs(lists) do
+        for _, entry in ipairs(list) do
+            if not entry.registered and isAvailable(entry.from, now) then
+                entry.registered = true
+                modules.files:overrideFileWith(entry.trigger, entry.path)
+            end
         end
     end
 end
@@ -733,7 +757,8 @@ local function registerOverridesForDirectory(dir, extreme, dated, fnfDir)
         return
     end
 
-    local datedList = fnfDir ~= nil and DATED_MAPS[fnfDir:lower()] or nil
+    local lists = fnfDir ~= nil and DATED_MAPS[fnfDir:lower()] or nil
+    local datedList = lists ~= nil and lists[extreme and "extreme" or "crusader"] or nil
 
     for k, path in ipairs(results) do
         local fileName = path:match("([^/\\]+)$") or path
@@ -850,11 +875,12 @@ return {
 
                 log(DEBUG, "Registering extra map dir: " .. tostring(fnfDir))
 
-                local dated = registerAvailability(fnfDir, dir)
+                local dated = registerAvailability(fnfDir, dir, { crusader = true })
                 registerExtraDir("maps\\*.map", fnfDir)
                 -- registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
                 registerOverridesForDirectory(dir, false, dated, fnfDir)
+                activateDatedMaps(fnfDir, today())
             else
                 log(DEBUG, "No extra map directory found in the config")
             end
@@ -870,11 +896,12 @@ return {
 
                 log(DEBUG, "Registering extra map extreme dir: " .. tostring(fnfDir))
 
-                local dated = registerAvailability(fnfDir, dir)
+                local dated = registerAvailability(fnfDir, dir, { extreme = true })
                 -- registerExtraDir("maps\\*.map", fnfDir)
                 registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
                 registerOverridesForDirectory(dir, true, dated, fnfDir)
+                activateDatedMaps(fnfDir, today())
             else
                 log(DEBUG, "No extra map extreme directory found in the config")
             end
@@ -919,7 +946,10 @@ return {
       -- FindNextFile Directory should end with *.map
       local fnfDir = prepareDir(dir, "map")
 
-      local dated = registerAvailability(fnfDir, dir)
+      local games = {}
+      if which == "both" or which == "crusader" then games.crusader = true end
+      if which == "both" or which == "extreme" then games.extreme = true end
+      local dated = registerAvailability(fnfDir, dir, games)
 
       if which == "both" or which == "crusader" then
         log(DEBUG, "Registering extra map crusader dir: " .. tostring(fnfDir))
@@ -937,5 +967,6 @@ return {
         registerOverridesForDirectory(dir, true, dated, fnfDir)
       end
 
+      activateDatedMaps(fnfDir, today())
     end,
 }
