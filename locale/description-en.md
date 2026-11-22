@@ -55,10 +55,10 @@ An extra map folder (from `registerExtraMapDirectory` or the maploader's extra m
 }
 ```
 
-- `"format": 1` is optional; other formats are not read.
-- Map names are the file names, with or without `.map`, in any letter case. Letters outside ASCII (such as `ü`) are compared loosely, because the game reads file names in the Windows code page: names that differ only in such letters count as the same name. ASCII file names are safest.
-- A missing, unreadable or broken file (also one larger than 256 KB), or an entry without a real `YYYY-MM-DD` date, never hides a map. The module writes a warning to the log and lists the map. Only folders inside the game folder can have an `availability.json`.
+- `"format": 1` is optional; other formats are not read. The file must be valid JSON of at most 32 KB.
+- Map names are the file names, with or without `.map`, compared without ASCII letter case. The game reads file names in the Windows code page; a name with letters such as `ü` is also matched in its Latin-1 form, which fits Western European Windows. Names with letters outside Latin-1 can't be matched, so those maps are listed from the start. ASCII file names are safest.
+- A missing or broken file, or an entry without a real `YYYY-MM-DD` date, never hides a map: the module writes a warning to the log (for a broken file or entry) and lists the map. A name given twice keeps the earlier date. Only folders inside the game folder can have an `availability.json`.
 - The game checks the dates whenever it builds its map list. A map whose day starts while the game is running appears the next time the list is built.
-- Until its date, a dated map can't be opened either. A map with the same name in the game's own `maps` folder or in another pack is used instead.
+- Until its date, a dated map also doesn't replace a map with the same name, for example one in the game's own `maps` folder. From its date on it does, like any other extra map; when several folders have a map of that name, the last one to become available is opened.
 - Saved games are not affected.
 - Map authors can preview a schedule without changing the system clock: set `map-availability-date` to a date such as `2026-12-05` in `ucp-config.yml`, in the files or the maploader configuration (the maploader's value wins when both are set). That date then counts as today. The option has no launcher control.
