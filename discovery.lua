@@ -20,68 +20,126 @@ An extra map directory may contain a file named availability.json:
     }
   }
 
-A map named in "maps" (with or without ".map") is listed by the game only from that date on,
-in the player's local time. Maps that are not named are listed as before. A missing or invalid
-file, or an invalid entry, never hides a map: a warning is logged and the map is listed.
+A map named in "maps" (with or without ".map") is listed by the game, and can be opened, only
+from that date on, in the player's local time. Maps that are not named are listed as before. A
+missing, unreadable or invalid file, or an invalid entry, never hides a map: the map is listed
+and, for a broken file or entry, a warning is logged.
+
+Map names are compared without letter case. Letters outside ASCII (such as "ü") are compared
+loosely, because the game reads file names in the Windows code page while the file is UTF-8:
+every run of such letters counts as one placeholder on both sides.
 
 The option "map-availability-date" ("YYYY-MM-DD") makes that date count as today, so map
 authors and testers can preview a schedule without changing the system clock.
 
-The date is checked each time the game builds its map list, so a map whose date arrives while
-the game runs appears the next time the list is built.
+The date is checked each time the game builds its map list and each time it opens a dated map,
+so a map whose date arrives while the game runs appears the next time the list is built.
 --]]
 local AVAILABILITY_FILE_NAME = "availability.json"
 
----Per FindFirstFile pattern of an extra directory (lower case): lower-case map name -> yyyymmdd
+-- larger files are not read: the JSON reader slows down badly on big inputs
+local AVAILABILITY_MAX_BYTES = 256 * 1024
+
+---Per FindFirstFile pattern of an extra directory (lower case): map key -> yyyymmdd
 ---@type table<string, table<string, number>>
 local AVAILABLE_FROM = {}
+
+---Game file path of a dated map (lower case, e.g. "maps\\door05.map") -> { path, from }
+---@type table<string, table>
+local DATED_OVERRIDES = {}
+local datedOverrideFunctionRegistered = false
 
 ---yyyymmdd that counts as today instead of the system date, or nil
 ---@type number|nil
 local TODAY_OVERRIDE = nil
 
----Parses "YYYY-MM-DD" into yyyymmdd, or returns nil
+local DAYS_IN_MONTH = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+
+local function isLeapYear(y)
+    return (y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0)
+end
+
+---Parses "YYYY-MM-DD" (a real calendar date) into yyyymmdd, or returns nil
 local function parseDate(value)
     if type(value) ~= "string" then return nil end
     local y, m, d = value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
     if y == nil then return nil end
     y, m, d = tonumber(y), tonumber(m), tonumber(d)
-    if m < 1 or m > 12 or d < 1 or d > 31 then return nil end
+    if y < 1 or m < 1 or m > 12 or d < 1 then return nil end
+    local days = DAYS_IN_MONTH[m]
+    if m == 2 and isLeapYear(y) then days = 29 end
+    if d > days then return nil end
     return y * 10000 + m * 100 + d
 end
 
+---Today as yyyymmdd, or nil when the system date can't be read
 local function today()
     if TODAY_OVERRIDE ~= nil then return TODAY_OVERRIDE end
     local now = os.date("*t")
+    if type(now) ~= "table" then return nil end
     return now.year * 10000 + now.month * 100 + now.day
 end
 
+---True when a map dated `from` is available today (an unreadable date counts as available)
+local function isAvailable(from)
+    if from == nil then return true end
+    local now = today()
+    return now == nil or from <= now
+end
+
+---Comparison key of a map name: lower case, without ".map", non-ASCII runs as one "?"
 local function mapKey(name)
-    local key = name:lower()
+    local key = name:gsub("[\128-\255]+", "?"):lower()
     if key:sub(-4) == ".map" then key = key:sub(1, -5) end
     return key
 end
 
+---The folder part of a registered directory, which may end in "\*.map"
+local function folderOf(dir)
+    local folder = dir:gsub("[/\\]%*%.[Mm][Aa][Pp]$", "")
+    if folder:sub(-1) ~= "/" and folder:sub(-1) ~= "\\" then folder = folder .. "/" end
+    return folder
+end
+
 ---Reads the availability.json of an extra map directory.
 ---@param dir string the directory as registered
----@return table<string, number>|nil lower-case map name -> yyyymmdd, nil without a usable file
+---@return table<string, number>|nil map key -> yyyymmdd, nil without a usable file
 local function readAvailability(dir)
-    local path = dir
-    if path:sub(-1) ~= "/" and path:sub(-1) ~= "\\" then path = path .. "/" end
-    path = path .. AVAILABILITY_FILE_NAME
+    local path = folderOf(dir) .. AVAILABILITY_FILE_NAME
 
-    local handle = io.open(path, "rb")
-    if handle == nil then return nil end
-    local text = handle:read("*all")
-    handle:close()
+    -- The framework's io.open raises an error for paths outside the game folder and for
+    -- folders of extensions that aren't installed; such folders simply have no schedule.
+    local opened, handle = pcall(io.open, path, "rb")
+    if not opened or handle == nil then
+        log(VERBOSE, string.format("readAvailability: no availability file at %s", path))
+        return nil
+    end
+    local read, text = pcall(function() return handle:read(AVAILABILITY_MAX_BYTES + 1) end)
+    pcall(function() handle:close() end)
+    if not read or text == nil then
+        log(WARNING, string.format("%s cannot be read; every map in this folder is listed", path))
+        return nil
+    end
+    if #text > AVAILABILITY_MAX_BYTES then
+        log(WARNING, string.format("%s is larger than %d bytes; every map in this folder is listed",
+            path, AVAILABILITY_MAX_BYTES))
+        return nil
+    end
+    if text:sub(1, 3) == "\239\187\191" then
+        text = text:sub(4) -- UTF-8 byte order mark
+    end
 
     local ok, data = pcall(function() return json:decode(text) end)
-    if not ok or type(data) ~= "table" or type(data.maps) ~= "table" then
-        log(WARNING, string.format("%s is not a valid availability file; every map in this folder is listed", path))
+    if not ok or type(data) ~= "table" then
+        log(WARNING, string.format("%s is not valid JSON; every map in this folder is listed", path))
         return nil
     end
     if data.format ~= nil and data.format ~= 1 then
         log(WARNING, string.format("%s: unknown format %s; every map in this folder is listed", path, tostring(data.format)))
+        return nil
+    end
+    if type(data.maps) ~= "table" then
+        log(WARNING, string.format("%s has no \"maps\" object; every map in this folder is listed", path))
         return nil
     end
 
@@ -89,11 +147,15 @@ local function readAvailability(dir)
     local count = 0
     for name, date in pairs(data.maps) do
         local from = parseDate(date)
-        if type(name) ~= "string" or name == "" or from == nil then
-            log(WARNING, string.format("%s: entry %s = %s ignored (expected a map name and \"YYYY-MM-DD\"); the map is listed",
+        local key = type(name) == "string" and mapKey(name) or ""
+        if key == "" or from == nil then
+            log(WARNING, string.format("%s: entry %s = %s ignored (expected a map name and a date \"YYYY-MM-DD\"); the map is listed",
                 path, tostring(name), tostring(date)))
+        elseif result[key] ~= nil then
+            log(WARNING, string.format("%s: %s is named twice; the earlier date counts", path, tostring(name)))
+            result[key] = math.min(result[key], from)
         else
-            result[mapKey(name)] = from
+            result[key] = from
             count = count + 1
         end
     end
@@ -102,10 +164,28 @@ local function readAvailability(dir)
 end
 
 ---Remembers the dated maps of an extra directory under its FindFirstFile pattern
+---@return table<string, number>|nil the dated maps of the directory
 local function registerAvailability(fnfDir, dir)
     local dated = readAvailability(dir)
     if dated ~= nil then
         AVAILABLE_FROM[fnfDir:lower()] = dated
+    end
+    return dated
+end
+
+---Redirects the game's open of a dated map to its file only once its date has come, so a
+---same-named map elsewhere (the game's own folder, another pack) is used until then.
+local function registerDatedOverride(trigger, path, from)
+    DATED_OVERRIDES[trigger:lower()] = { path = path, from = from }
+    if not datedOverrideFunctionRegistered then
+        datedOverrideFunctionRegistered = true
+        modules.files:registerOverrideFunction(function(file)
+            local entry = DATED_OVERRIDES[file:lower()]
+            if entry ~= nil and isAvailable(entry.from) then
+                return entry.path
+            end
+            return nil
+        end)
     end
 end
 
@@ -116,7 +196,7 @@ local function setTodayOverride(value)
     end
     local parsed = parseDate(value)
     if parsed == nil then
-        log(WARNING, string.format("map-availability-date: %s ignored (expected \"YYYY-MM-DD\")", tostring(value)))
+        log(WARNING, string.format("map-availability-date: %s ignored (expected a date \"YYYY-MM-DD\")", tostring(value)))
         TODAY_OVERRIDE = nil
         return
     end
@@ -307,7 +387,7 @@ local DiscoveryHandler = {
                 local t = dosTime()
 
                 local from = dated ~= nil and dated[mapKey(name)] or nil
-                if from ~= nil and from > now then
+                if from ~= nil and now ~= nil and from > now then
                     log(VERBOSE, string.format("discoverForPattern: %s is listed from %d on", name, from))
                     notYet = notYet + 1
                 else
@@ -328,8 +408,8 @@ local DiscoveryHandler = {
         end
 
         if dated ~= nil then
-            log(INFO, string.format("discoverForPattern: %s: %d maps not listed yet (today counts as %d)",
-                pattern, notYet, now))
+            log(INFO, string.format("discoverForPattern: %s: %d maps not listed yet (today counts as %s)",
+                pattern, notYet, tostring(now)))
         end
 
         rawInterface.FindClose(handle)
@@ -454,7 +534,8 @@ end
 local MAP_SUFFIX = ".map"
 
 -- TODO: this can be moved to the discovery logic
-local function registerOverridesForDirectory(dir, extreme)
+---@param dated table<string, number>|nil the directory's dated maps (map key -> yyyymmdd)
+local function registerOverridesForDirectory(dir, extreme, dated)
     log(DEBUG, "registerOverridesForDirectory: Registering map files in: " .. tostring(dir))
 
     local status, results = pcall(function()
@@ -476,7 +557,12 @@ local function registerOverridesForDirectory(dir, extreme)
                 trigger = "mapsExtreme\\" .. mapName .. ".map"
             end
             log(DEBUG, "registerOverridesForDirectory: files(): Registering " .. tostring(trigger) .. " => " .. tostring(path))
-            modules.files:overrideFileWith(trigger, path)
+            local from = dated ~= nil and dated[mapKey(mapName)] or nil
+            if from ~= nil then
+                registerDatedOverride(trigger, path, from)
+            else
+                modules.files:overrideFileWith(trigger, path)
+            end
         end
     end
 end
@@ -570,11 +656,11 @@ return {
 
                 log(DEBUG, "Registering extra map dir: " .. tostring(fnfDir))
 
-                registerAvailability(fnfDir, dir)
+                local dated = registerAvailability(fnfDir, dir)
                 registerExtraDir("maps\\*.map", fnfDir)
                 -- registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
-                registerOverridesForDirectory(dir, false)
+                registerOverridesForDirectory(dir, false, dated)
             else
                 log(DEBUG, "No extra map directory found in the config")
             end
@@ -590,11 +676,11 @@ return {
 
                 log(DEBUG, "Registering extra map extreme dir: " .. tostring(fnfDir))
 
-                registerAvailability(fnfDir, dir)
+                local dated = registerAvailability(fnfDir, dir)
                 -- registerExtraDir("maps\\*.map", fnfDir)
                 registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
-                registerOverridesForDirectory(dir, true)
+                registerOverridesForDirectory(dir, true, dated)
             else
                 log(DEBUG, "No extra map extreme directory found in the config")
             end
@@ -639,14 +725,14 @@ return {
       -- FindNextFile Directory should end with *.map
       local fnfDir = prepareDir(dir, "map")
 
-      registerAvailability(fnfDir, dir)
+      local dated = registerAvailability(fnfDir, dir)
 
       if which == "both" or which == "crusader" then
         log(DEBUG, "Registering extra map crusader dir: " .. tostring(fnfDir))
         registerExtraDir("maps\\*.map", fnfDir)
         -- registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
-        registerOverridesForDirectory(dir, false)
+        registerOverridesForDirectory(dir, false, dated)
       end
 
       if which == "both" or which == "extreme" then
@@ -654,7 +740,7 @@ return {
               -- registerExtraDir("maps\\*.map", fnfDir)
         registerExtraDir("mapsExtreme\\*.map", fnfDir)
 
-        registerOverridesForDirectory(dir, true)
+        registerOverridesForDirectory(dir, true, dated)
       end
 
     end,
