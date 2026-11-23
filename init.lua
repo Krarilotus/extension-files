@@ -42,6 +42,18 @@ function files:registerExtraMapDirectory(path, which)
   return discovery.registerExtraMapDirectory(path, which)
 end
 
+---Whether a map named in the availability.json of an extra map directory can be played today,
+---and the date it opens. A map whose date has come gets its file redirect at this call, so it
+---can be opened even if the game hasn't built its map list since that date.
+---@param self table the files module itself
+---@param name string the map name, with or without ".map"
+---@param which string|nil "crusader" (default) or "extreme"
+---@return boolean available false only while a dated map's date hasn't come
+---@return string|nil from the date ("YYYY-MM-DD") of a dated map, nil for other maps
+function files:getMapAvailability(name, which)
+  return discovery.getMapAvailability(name, which)
+end
+
 return files, {
     public = {
         "overrideFileWith",
@@ -49,5 +61,6 @@ return files, {
         "setIterationOption",
         'registerFileSource',
         'registerExtraMapDirectory',
+        'getMapAvailability',
     }
 }

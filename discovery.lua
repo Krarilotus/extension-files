@@ -391,6 +391,44 @@ local function activateDatedMaps(pattern, now)
     end
 end
 
+local function formatDate(value)
+    return string.format("%04d-%02d-%02d", value // 10000, (value // 100) % 100, value % 100)
+end
+
+---Whether a map named in an availability.json can be played today. A map whose date has come
+---gets its file redirect now, so it opens even if the map list hasn't been shown since.
+---@param name string the map name, with or without ".map"
+---@param game string|nil "crusader" (default) or "extreme"
+---@return boolean available false only while a dated map's date hasn't come
+---@return string|nil from the date ("YYYY-MM-DD") of a dated map; the latest one when several folders date it
+local function getMapAvailability(name, game)
+    if type(name) ~= "string" or name == "" then return true, nil end
+    local which = game == "extreme" and "extreme" or "crusader"
+    local keys = scheduleKeys(name)
+    local now = today()
+    local available, latest = true, nil
+    for _, lists in pairs(DATED_MAPS) do
+        for _, entry in ipairs(lists[which] or {}) do
+            local entryKey = fileKey(entry.trigger:match("([^\\]+)$") or entry.trigger)
+            for _, key in ipairs(keys) do
+                if key == entryKey then
+                    if isAvailable(entry.from, now) then
+                        if not entry.registered then
+                            entry.registered = true
+                            modules.files:overrideFileWith(entry.trigger, entry.path)
+                        end
+                    else
+                        available = false
+                    end
+                    if latest == nil or entry.from > latest then latest = entry.from end
+                    break
+                end
+            end
+        end
+    end
+    return available, latest ~= nil and formatDate(latest) or nil
+end
+
 local function setTodayOverride(value)
     if value == nil or value == "" then
         TODAY_OVERRIDE = nil
@@ -816,6 +854,8 @@ local function prepareDir(dir, ext)
 end
 
 return {
+    getMapAvailability = getMapAvailability,
+
     setOption = function(key, value)
         if key == "disable-game-maps" then
             if value == true then
