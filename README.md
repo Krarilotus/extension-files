@@ -22,5 +22,10 @@ An extra map folder (from `registerExtraMapDirectory` or the maploader's extra m
 - The game checks the dates whenever it builds its map list. A map whose day starts while the game is running appears the next time the list is built.
 - Until its date, a dated map also doesn't replace a map with the same name, for example one in the game's own `maps` folder. From its date on it does, like any other extra map. When several folders have a map of that name, which one opens depends on the order in which they are registered and become available, so give dated maps names of their own.
 - Saved games are not affected.
-- Other modules can ask whether a map can be played today with `modules.files:getMapAvailability(name, "crusader")`. It returns `false` and the date (`"2026-12-05"`) while a dated map's date hasn't come, and `true` (plus the date, for a dated map) otherwise. A map whose date has come also gets its file redirect then, so a module can open it without the map list having been shown. Custom Skirmish Trails uses this for its scenario missions.
+- Other modules can ask whether a map can be played today with `modules.files:getMapAvailability(name, game)`, `game` being `"crusader"` (the default) or `"extreme"`. It decides as the map list does and returns:
+  - `false` and the earliest date one of its copies opens (`"2026-12-05"`) while no copy of a dated map can be opened;
+  - `true` and the date of the dated copy that opens;
+  - `true, nil` when an undated copy in an extra map folder opens, or when no `availability.json` names the map. It doesn't check that the map exists, and a same-named map in the game's own folders isn't looked at.
+
+  Dated maps whose date has come get their file redirects at this call, as when the list is built, so a module can open the map without the list having been shown. Custom Skirmish Trails uses this for its scenario missions.
 - Map authors can preview a schedule without changing the system clock: set `map-availability-date` to a date such as `2026-12-05` in `ucp-config.yml`, in the files or the maploader configuration (the maploader's value wins when both are set). That date then counts as today. The option has no launcher control.

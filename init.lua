@@ -43,13 +43,15 @@ function files:registerExtraMapDirectory(path, which)
 end
 
 ---Whether a map named in the availability.json of an extra map directory can be played today,
----and the date it opens. A map whose date has come gets its file redirect at this call, so it
----can be opened even if the game hasn't built its map list since that date.
+---decided as the map list decides it. Dated maps whose date has come get their file redirects at
+---this call, as when the list is built, so the map can be opened without the list.
 ---@param self table the files module itself
 ---@param name string the map name, with or without ".map"
 ---@param which string|nil "crusader" (default) or "extreme"
----@return boolean available false only while a dated map's date hasn't come
----@return string|nil from the date ("YYYY-MM-DD") of a dated map, nil for other maps
+---@return boolean available false while no copy of the dated map can be opened yet; true for a
+---map that is due, or that no availability.json names (also when the map doesn't exist)
+---@return string|nil from "YYYY-MM-DD": the date of the dated copy that opens, or while none can,
+---the earliest date one opens; nil when no copy is dated or an undated copy opens
 function files:getMapAvailability(name, which)
   return discovery.getMapAvailability(name, which)
 end

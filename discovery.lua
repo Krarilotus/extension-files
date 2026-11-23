@@ -384,8 +384,8 @@ local function activateDatedMaps(pattern, now)
     for _, list in pairs(lists) do
         for _, entry in ipairs(list) do
             if not entry.registered and isAvailable(entry.from, now) then
-                entry.registered = true
                 modules.files:overrideFileWith(entry.trigger, entry.path)
+                entry.registered = true
             end
         end
     end
@@ -395,38 +395,43 @@ local function formatDate(value)
     return string.format("%04d-%02d-%02d", value // 10000, (value // 100) % 100, value % 100)
 end
 
----Whether a map named in an availability.json can be played today. A map whose date has come
----gets its file redirect now, so it opens even if the map list hasn't been shown since.
+---Whether a map named in an availability.json can be played today, decided as the map list
+---decides it: the extra folders' dated maps whose date has come get their redirects, folder by
+---folder in the list's order, and the map can be played when a redirect for its name exists.
 ---@param name string the map name, with or without ".map"
 ---@param game string|nil "crusader" (default) or "extreme"
----@return boolean available false only while a dated map's date hasn't come
----@return string|nil from the date ("YYYY-MM-DD") of a dated map; the latest one when several folders date it
+---@return boolean available false while no copy of a dated map can be opened yet
+---@return string|nil from the date ("YYYY-MM-DD") of the dated copy that opens, or while none
+---can, the earliest date one of them opens; nil when no copy is dated or an undated copy opens
 local function getMapAvailability(name, game)
     if type(name) ~= "string" or name == "" then return true, nil end
     local which = game == "extreme" and "extreme" or "crusader"
-    local keys = scheduleKeys(name)
     local now = today()
-    local available, latest = true, nil
+    for _, pattern in ipairs(EXTRA_DIRS[which == "extreme" and "mapsExtreme\\*.map" or "maps\\*.map"] or {}) do
+        activateDatedMaps(pattern, now)
+    end
+    local keys = {}
+    for _, key in ipairs(scheduleKeys(name)) do keys[key] = true end
+    local copies, earliest = {}, nil
     for _, lists in pairs(DATED_MAPS) do
         for _, entry in ipairs(lists[which] or {}) do
-            local entryKey = fileKey(entry.trigger:match("([^\\]+)$") or entry.trigger)
-            for _, key in ipairs(keys) do
-                if key == entryKey then
-                    if isAvailable(entry.from, now) then
-                        if not entry.registered then
-                            entry.registered = true
-                            modules.files:overrideFileWith(entry.trigger, entry.path)
-                        end
-                    else
-                        available = false
-                    end
-                    if latest == nil or entry.from > latest then latest = entry.from end
-                    break
-                end
+            if keys[entry.key] then
+                table.insert(copies, entry)
+                if earliest == nil or entry.from < earliest then earliest = entry.from end
             end
         end
     end
-    return available, latest ~= nil and formatDate(latest) or nil
+    if #copies == 0 then return true, nil end
+    local opens = overrideRegistry.FILE_OVERRIDES[copies[1].trigger:lower()]
+    if opens == nil then
+        return false, formatDate(earliest)
+    end
+    for _, entry in ipairs(copies) do
+        if entry.registered and (entry.path:gsub("/+", "\\")) == opens then
+            return true, formatDate(entry.from)
+        end
+    end
+    return true, nil
 end
 
 local function setTodayOverride(value)
@@ -815,7 +820,7 @@ local function registerOverridesForDirectory(dir, extreme, dated, fnfDir)
                 if existing ~= nil and existing == (path:gsub("/+", "\\")) then
                     overrideRegistry.FILE_OVERRIDES[trigger:lower()] = nil
                 end
-                table.insert(datedList, { trigger = trigger, path = path, from = from, registered = false })
+                table.insert(datedList, { trigger = trigger, key = fileKey(fileName), path = path, from = from, registered = false })
             else
                 log(DEBUG, "registerOverridesForDirectory: files(): Registering " .. tostring(trigger) .. " => " .. tostring(path))
                 modules.files:overrideFileWith(trigger, path)
