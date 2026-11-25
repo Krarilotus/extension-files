@@ -24,8 +24,8 @@ An extra map directory may contain a file named availability.json:
 
 A map named in "maps" (with or without ".map") is listed by the game only from that date on, in
 the player's local time, and its file replaces a same-named map only from then on. Maps that are
-not named are listed as before. A missing or invalid file, or an invalid entry, never hides a
-map: the map is listed and, for a broken file or entry, a warning is logged.
+not named are listed as before. A missing file leaves maps listed. A decode error or an invalid schedule shape leaves all
+maps in the folder listed with a warning, and invalid entries leave their own maps listed.
 
 Map names are compared exactly, apart from ASCII letter case and the ".map" ending. The game
 reads file names in the Windows code page; a name written in UTF-8 in the file is also tried in
@@ -117,162 +117,8 @@ local function scheduleKeys(name)
     return keys, false
 end
 
---[[
-A small strict JSON reader for availability.json: linear time, rejects malformed input
-(including bad escapes and trailing data) and reports keys that appear twice in an object.
---]]
-local JSON_ESCAPES = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
-
-local function decodeJson(text)
-    local pos, len = 1, #text
-    local repeated = {} -- object table -> list of { key, value } for keys seen before
-    local nulls = {}    -- object table -> keys whose value is null
-
-    local function fail(message)
-        error({ json = string.format("%s at byte %d", message, pos) }, 0)
-    end
-    local function skip()
-        pos = text:find("[^ \t\r\n]", pos) or (len + 1)
-    end
-    local function expect(char)
-        if text:sub(pos, pos) ~= char then fail("expected '" .. char .. "'") end
-        pos = pos + 1
-    end
-
-    local parseValue
-
-    local function parseString()
-        expect('"')
-        local parts = {}
-        while true do
-            local s = text:find('["\\\0-\31]', pos)
-            if s == nil then fail("unterminated string") end
-            parts[#parts + 1] = text:sub(pos, s - 1)
-            local c = text:sub(s, s)
-            if c == '"' then
-                pos = s + 1
-                return table.concat(parts)
-            elseif c ~= "\\" then
-                pos = s
-                fail("control character in a string")
-            end
-            local e = text:sub(s + 1, s + 1)
-            if JSON_ESCAPES[e] ~= nil then
-                parts[#parts + 1] = JSON_ESCAPES[e]
-                pos = s + 2
-            elseif e == "u" then
-                local hex = text:sub(s + 2, s + 5)
-                pos = s
-                if not hex:match("^%x%x%x%x$") then fail("bad \\u escape") end
-                local codepoint = tonumber(hex, 16)
-                local length = 6
-                if codepoint >= 0xD800 and codepoint <= 0xDBFF then
-                    local low = text:sub(s + 6, s + 11)
-                    if not low:match("^\\u[dD][c-fC-F]%x%x$") then fail("unpaired \\u escape") end
-                    codepoint = 0x10000 + (codepoint - 0xD800) * 0x400 + (tonumber(low:sub(3), 16) - 0xDC00)
-                    length = 12
-                elseif codepoint >= 0xDC00 and codepoint <= 0xDFFF then
-                    fail("unpaired \\u escape")
-                end
-                parts[#parts + 1] = utf8.char(codepoint)
-                pos = s + length
-            else
-                pos = s
-                fail("bad escape")
-            end
-        end
-    end
-
-    local function parseNumber()
-        local s, e = text:find("^-?%d+", pos)
-        if s == nil then fail("bad value") end
-        local f = select(2, text:find("^%.%d+", e + 1))
-        if f ~= nil then e = f end
-        f = select(2, text:find("^[eE][-+]?%d+", e + 1))
-        if f ~= nil then e = f end
-        local number = tonumber(text:sub(s, e))
-        pos = e + 1
-        return number
-    end
-
-    local function parseContainer(depth, open, close, readEntry)
-        if depth > 16 then fail("too deeply nested") end
-        expect(open)
-        skip()
-        local result = {}
-        if text:sub(pos, pos) == close then
-            pos = pos + 1
-            return result
-        end
-        while true do
-            readEntry(result)
-            skip()
-            local c = text:sub(pos, pos)
-            if c == close then
-                pos = pos + 1
-                return result
-            elseif c ~= "," then
-                fail("expected ',' or '" .. close .. "'")
-            end
-            pos = pos + 1
-            skip()
-        end
-    end
-
-    parseValue = function(depth)
-        skip()
-        local c = text:sub(pos, pos)
-        if c == "{" then
-            local seen = {}
-            return parseContainer(depth, "{", "}", function(object)
-                local key = parseString()
-                skip()
-                expect(":")
-                local value = parseValue(depth + 1)
-                if value == nil then
-                    nulls[object] = nulls[object] or {}
-                    table.insert(nulls[object], key)
-                end
-                if seen[key] then
-                    repeated[object] = repeated[object] or {}
-                    table.insert(repeated[object], { key, value })
-                else
-                    seen[key] = true
-                    object[key] = value
-                end
-            end)
-        elseif c == "[" then
-            return parseContainer(depth, "[", "]", function(array)
-                array[#array + 1] = parseValue(depth + 1)
-            end)
-        elseif c == '"' then
-            return parseString()
-        elseif text:sub(pos, pos + 3) == "true" then
-            pos = pos + 4
-            return true
-        elseif text:sub(pos, pos + 4) == "false" then
-            pos = pos + 5
-            return false
-        elseif text:sub(pos, pos + 3) == "null" then
-            pos = pos + 4
-            return nil
-        else
-            return parseNumber()
-        end
-    end
-
-    local ok, value = pcall(function()
-        local result = parseValue(1)
-        skip()
-        if pos <= len then fail("unexpected data after the end") end
-        return result
-    end)
-    if not ok then
-        if type(value) == "table" and value.json ~= nil then return nil, value.json end
-        return nil, tostring(value)
-    end
-    return value, nil, repeated, nulls
-end
+local availabilityJson = json:new({ strictTypes = true })
+local jsonObject = getmetatable(availabilityJson:newObject())
 
 ---The folder of a registered directory, which may end in "\*.map"
 local function folderOf(dir)
@@ -308,38 +154,30 @@ local function readAvailability(dir)
         text = text:sub(4) -- UTF-8 byte order mark
     end
 
-    local data, decodeError, repeated, nulls = decodeJson(text)
-    if type(data) ~= "table" then
+    local decoded, data, decodeError = pcall(availabilityJson.decode, availabilityJson, text)
+    if not decoded or decodeError ~= nil then
         log(WARNING, string.format("%s is not valid JSON (%s); every map in this folder is listed",
-            path, tostring(decodeError or "not an object")))
+            path, tostring(decodeError or data)))
+        return nil
+    end
+    if getmetatable(data) ~= jsonObject then
+        log(WARNING, string.format("%s must contain a JSON object; every map in this folder is listed", path))
         return nil
     end
     if data.format ~= nil and data.format ~= 1 then
         log(WARNING, string.format("%s: unknown format %s; every map in this folder is listed", path, tostring(data.format)))
         return nil
     end
-    if type(data.maps) ~= "table" then
+    if getmetatable(data.maps) ~= jsonObject then
         log(WARNING, string.format("%s has no \"maps\" object; every map in this folder is listed", path))
         return nil
     end
 
-    local entries = {}
-    for name, date in pairs(data.maps) do
-        table.insert(entries, { name, date })
-    end
-    for _, entry in ipairs(repeated[data.maps] or {}) do
-        table.insert(entries, entry)
-    end
-    for _, name in ipairs(nulls[data.maps] or {}) do
-        table.insert(entries, { name, nil })
-    end
-
     local result = {}
     local count = 0
-    for _, entry in ipairs(entries) do
-        local name, date = entry[1], entry[2]
+    for name, date in pairs(data.maps) do
         local from = parseDate(date)
-        local keys, wide = scheduleKeys(type(name) == "string" and name or "")
+        local keys, wide = scheduleKeys(name)
         if keys[1] == "" or from == nil then
             log(WARNING, string.format("%s: entry %s = %s ignored (expected a map name and a date \"YYYY-MM-DD\"); the map is listed",
                 path, tostring(name), tostring(date)))
